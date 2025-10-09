@@ -31,6 +31,26 @@ int main(int argc, char** argv) {
         proc36::BeamStackSearchConfig config;
         if (problem.size > 8) {
             config.rotation_sizes = {2, 3, 4, 5};
+            config.beam_width = 96;
+            config.max_depth = 28;
+            config.max_children_per_node = 48;
+            config.operation_penalty = 0.05;
+            config.time_limit_ms = 4800.0;
+        }
+        if (problem.size >= 16) {
+            config.rotation_sizes = {2, 3, 4, 5, 6};
+            config.beam_width = 128;
+            config.max_depth = 40;
+            config.max_nodes = 200'000;
+            config.max_children_per_node = 64;
+            config.operation_penalty = 0.03;
+        }
+        if (problem.size >= 22) {
+            config.beam_width = 160;
+            config.max_depth = 48;
+            config.max_nodes = 300'000;
+            config.time_limit_ms = 4900.0;
+            config.operation_penalty = 0.02;
         }
 
         proc36::BeamStackSearchSolver solver(config);

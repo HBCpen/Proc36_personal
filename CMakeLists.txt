@@ -37,3 +37,7 @@ add_executable(beam_solver
 )
 
 target_link_libraries(beam_solver PRIVATE proc36_lib)
+
+add_executable(generate_problem
+    src/tools/generate_problem.cpp
+)
