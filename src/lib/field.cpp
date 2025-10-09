@@ -1,9 +1,11 @@
 #include "lib/field.hpp"
 
+#include <algorithm>
 #include <cmath>
+#include <limits>
 #include <sstream>
 #include <stdexcept>
-#include <unordered_map>
+#include <vector>
 
 namespace proc36 {
 
@@ -91,31 +93,62 @@ std::vector<Position> Field::positions_of(int value) const {
 }
 
 PairStatus Field::evaluate_pairs() const {
-    std::unordered_map<int, Position> first_occurrence;
-    first_occurrence.reserve(size_ * size_ / 2);
-    std::size_t matched = 0;
-    std::size_t unmatched = 0;
+    return evaluate_pair_metrics().status;
+}
 
-    for (std::size_t y = 0; y < size_; ++y) {
-        for (std::size_t x = 0; x < size_; ++x) {
-            const auto value = cells_[y * size_ + x];
-            auto it = first_occurrence.find(value);
-            if (it == first_occurrence.end()) {
-                first_occurrence.emplace(value, Position{x, y});
-                continue;
-            }
-            const auto& first = it->second;
-            const auto dist = static_cast<int>(std::abs(static_cast<int>(first.x) - static_cast<int>(x))) +
-                              static_cast<int>(std::abs(static_cast<int>(first.y) - static_cast<int>(y)));
-            if (dist == 1) {
-                ++matched;
-            } else {
-                ++unmatched;
-            }
+PairMetrics Field::evaluate_pair_metrics() const {
+    PairMetrics metrics;
+    metrics.unmatched_mask.assign(cells_.size(), 0);
+
+    const auto initial_pairs = cells_.size() / 2;
+    const Position sentinel{size_, size_};
+    std::vector<Position> first_positions(initial_pairs, sentinel);
+    std::vector<std::size_t> first_indices(initial_pairs, std::numeric_limits<std::size_t>::max());
+
+    auto ensure_capacity = [&](std::size_t value) {
+        if (value >= first_positions.size()) {
+            const auto new_size = value + 1;
+            first_positions.resize(new_size, sentinel);
+            first_indices.resize(new_size, std::numeric_limits<std::size_t>::max());
+        }
+    };
+
+    for (std::size_t idx = 0; idx < cells_.size(); ++idx) {
+        const auto value = cells_[idx];
+        if (value < 0) {
+            continue;  // ignore invalid negatives defensively
+        }
+        const auto uvalue = static_cast<std::size_t>(value);
+        ensure_capacity(uvalue);
+
+        if (first_indices[uvalue] == std::numeric_limits<std::size_t>::max()) {
+            const auto x = idx % size_;
+            const auto y = idx / size_;
+            first_positions[uvalue] = Position{x, y};
+            first_indices[uvalue] = idx;
+            continue;
+        }
+
+        const auto first_index = first_indices[uvalue];
+        const auto first_pos = first_positions[uvalue];
+        const auto x = idx % size_;
+        const auto y = idx / size_;
+        const auto distance = static_cast<std::size_t>(
+            std::abs(static_cast<int>(first_pos.x) - static_cast<int>(x)) +
+            std::abs(static_cast<int>(first_pos.y) - static_cast<int>(y)));
+
+        if (distance == 1) {
+            ++metrics.status.matched;
+        } else {
+            ++metrics.status.unmatched;
+            metrics.total_unmatched_distance += distance;
+            metrics.max_unmatched_distance = std::max(metrics.max_unmatched_distance, distance);
+            metrics.unmatched_mask[first_index] = 1;
+            metrics.unmatched_mask[idx] = 1;
         }
     }
 
-    return PairStatus{matched, unmatched};
+    return metrics;
 }
 
 bool Field::is_goal_state() const {

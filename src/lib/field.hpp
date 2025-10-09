@@ -14,12 +14,21 @@ struct Position {
     std::size_t x{};
     std::size_t y{};
 
-    [[nodiscard]] bool operator==(const Position&) const = default;
+    [[nodiscard]] bool operator==(const Position& other) const noexcept {
+        return x == other.x && y == other.y;
+    }
 };
 
 struct PairStatus {
     std::size_t matched{};
     std::size_t unmatched{};
+};
+
+struct PairMetrics {
+    PairStatus status{};
+    std::size_t total_unmatched_distance{};
+    std::size_t max_unmatched_distance{};
+    std::vector<std::uint8_t> unmatched_mask;  // row-major mask, 1 if the cell belongs to an unmatched pair
 };
 
 class Field {
@@ -41,6 +50,7 @@ public:
 
     [[nodiscard]] std::vector<Position> positions_of(int value) const;
     [[nodiscard]] PairStatus evaluate_pairs() const;
+    [[nodiscard]] PairMetrics evaluate_pair_metrics() const;
 
     [[nodiscard]] bool is_goal_state() const;
 
