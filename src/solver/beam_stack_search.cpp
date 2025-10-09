@@ -122,10 +122,10 @@ BeamStackSearchSolver::SearchLimits BeamStackSearchSolver::derive_limits(std::si
     SearchLimits limits{};
 
     const double normalized = std::max(1.0, static_cast<double>(board_size) / 8.0);
-    const double size_scale = config_.adaptive_limits ? std::pow(normalized, 1.2) : 1.0;
-    const double depth_scale = config_.adaptive_limits ? std::pow(normalized, 1.1) : 1.0;
-    const double node_scale = config_.adaptive_limits ? std::pow(normalized, 2.6) : 1.0;
-    const double child_scale = config_.adaptive_limits ? std::pow(normalized, 0.9) : 1.0;
+    const double size_scale = config_.adaptive_limits ? std::pow(normalized, 1.35) : 1.0;
+    const double depth_scale = config_.adaptive_limits ? std::pow(normalized, 1.25) : 1.0;
+    const double node_scale = config_.adaptive_limits ? std::pow(normalized, 3.0) : 1.0;
+    const double child_scale = config_.adaptive_limits ? std::pow(normalized, 1.1) : 1.0;
 
     auto scale_up = [](std::size_t base, double factor) -> std::size_t {
         if (base == 0) {
@@ -151,9 +151,9 @@ BeamStackSearchSolver::SearchLimits BeamStackSearchSolver::derive_limits(std::si
                                        0;
 
     if (config_.adaptive_limits && board_size <= 8) {
-        limits.max_depth = std::max<std::size_t>(limits.max_depth, 40);
-        limits.max_nodes = std::max<std::size_t>(limits.max_nodes, 250'000);
-        limits.max_children_per_node = std::max<std::size_t>(limits.max_children_per_node, 56);
+        limits.max_depth = std::max<std::size_t>(limits.max_depth, 48);
+        limits.max_nodes = std::max<std::size_t>(limits.max_nodes, 280'000);
+        limits.max_children_per_node = std::max<std::size_t>(limits.max_children_per_node, 64);
     }
 
     return limits;
@@ -277,11 +277,19 @@ BeamStackSearchSolver::IterationOutcome BeamStackSearchSolver::run_search_iterat
                 continue;
             }
 
-            if (limits.max_children_per_node > 0 && children.size() > limits.max_children_per_node) {
-                std::partial_sort(children.begin(),
-                                  children.begin() + static_cast<std::ptrdiff_t>(limits.max_children_per_node), children.end(),
-                                  [](const Node& a, const Node& b) { return a.score > b.score; });
-                children.resize(limits.max_children_per_node);
+            if (!children.empty()) {
+                std::size_t node_child_limit = limits.max_children_per_node;
+                if (node_child_limit > 0 && children.size() > node_child_limit) {
+                    const auto unmatched = node.metrics.status.unmatched;
+                    const std::size_t adaptive_bonus = unmatched * 2 + std::max<std::size_t>(1, limits.beam_width / 8);
+                    const std::size_t max_cap = limits.beam_width > 0 ? (limits.beam_width * 3) / 2 + 32 : children.size();
+                    node_child_limit = std::min<std::size_t>({children.size(), node_child_limit + adaptive_bonus, max_cap});
+
+                    std::partial_sort(children.begin(),
+                                      children.begin() + static_cast<std::ptrdiff_t>(node_child_limit), children.end(),
+                                      [](const Node& a, const Node& b) { return a.score > b.score; });
+                    children.resize(node_child_limit);
+                }
             }
 
             for (auto& child : children) {
@@ -317,6 +325,190 @@ iteration_finished:
     return outcome;
 }
 
+bool BeamStackSearchSolver::apply_shake(Node& node, BeamStackSearchResult& result, Timer& timer,
+                                        double& best_score) const {
+    if (config_.shake_attempts == 0 || config_.shake_max_length == 0) {
+        return false;
+    }
+    if (config_.time_limit_ms > 0.0 &&
+        timer.elapsed_ms() > config_.time_limit_ms * config_.shake_time_ratio) {
+        return false;
+    }
+
+    Node candidate = node;
+    const auto original_unmatched = candidate.metrics.status.unmatched;
+    const auto original_distance = candidate.metrics.total_unmatched_distance + candidate.metrics.max_unmatched_distance;
+
+    const std::size_t steps = static_cast<std::size_t>(
+        random_.next_int<std::size_t>(1, std::max<std::size_t>(1, config_.shake_max_length)));
+    std::size_t applied = 0;
+
+    for (; applied < steps; ++applied) {
+        if (config_.time_limit_ms > 0.0 && timer.elapsed_ms() > config_.time_limit_ms * config_.shake_time_ratio) {
+            break;
+        }
+
+        auto candidate_ops = generate_operations(candidate.field, candidate.operations, candidate.metrics);
+        if (candidate_ops.empty()) {
+            break;
+        }
+
+        const std::size_t sample = std::min<std::size_t>(candidate_ops.size(), static_cast<std::size_t>(64));
+        const std::size_t index = static_cast<std::size_t>(random_.next_int<std::size_t>(0, sample - 1));
+        const auto op = candidate_ops[index];
+
+        candidate.field.apply(op);
+        candidate.operations.push_back(op);
+        candidate.depth = candidate.operations.size();
+        candidate.metrics = candidate.field.evaluate_pair_metrics();
+        candidate.score = evaluate(candidate);
+
+        update_best(candidate, result, best_score);
+        ++result.explored_nodes;
+
+        if (candidate.metrics.status.unmatched == 0) {
+            node = std::move(candidate);
+            return true;
+        }
+    }
+
+    if (applied == 0) {
+        return false;
+    }
+
+    const auto new_unmatched = candidate.metrics.status.unmatched;
+    const auto new_distance = candidate.metrics.total_unmatched_distance + candidate.metrics.max_unmatched_distance;
+
+    const bool strict_improvement = new_unmatched < original_unmatched ||
+                                    (new_unmatched == original_unmatched && new_distance < original_distance);
+    const bool equal_accept = new_unmatched == original_unmatched && new_distance == original_distance &&
+                              random_.next_real(0.0, 1.0) < config_.shake_accept_equal_probability;
+
+    if (strict_improvement || equal_accept) {
+        node = std::move(candidate);
+        return true;
+    }
+
+    return false;
+}
+
+bool BeamStackSearchSolver::greedy_refinement(const Problem& problem, BeamStackSearchResult& result, Timer& timer,
+                                              double& best_score) const {
+    if (result.solved) {
+        return false;
+    }
+
+    Node state;
+    state.field = problem.make_field();
+    state.operations = result.operations;
+    for (const auto& op : state.operations) {
+        state.field.apply(op);
+    }
+    state.metrics = state.field.evaluate_pair_metrics();
+    state.depth = state.operations.size();
+    state.score = evaluate(state);
+
+    update_best(state, result, best_score);
+
+    if (state.metrics.status.unmatched == 0) {
+        result.solved = true;
+        result.status = state.metrics.status;
+        return true;
+    }
+
+    PairMetrics best_metrics = state.metrics;
+    std::vector<Operation> best_ops = state.operations;
+    bool improved = false;
+
+    const std::size_t max_attempts = std::max<std::size_t>(1, config_.refinement_attempts);
+    const std::size_t sample_limit = std::max<std::size_t>(1, config_.refinement_sample);
+    const double refinement_start_ms = timer.elapsed_ms();
+
+    for (std::size_t attempt = 0; attempt < max_attempts; ++attempt) {
+        if ((config_.time_limit_ms > 0.0 && timer.elapsed_ms() > config_.time_limit_ms) ||
+            (config_.refinement_time_budget_ms > 0.0 &&
+             timer.elapsed_ms() - refinement_start_ms > config_.refinement_time_budget_ms)) {
+            break;
+        }
+
+        auto candidate_ops = generate_operations(state.field, state.operations, state.metrics);
+        if (candidate_ops.empty()) {
+            break;
+        }
+
+        const std::size_t inspect = std::min<std::size_t>(candidate_ops.size(), sample_limit);
+        Node best_child;
+        bool has_child = false;
+
+        for (std::size_t idx = 0; idx < inspect; ++idx) {
+            const auto& op = candidate_ops[idx];
+
+            Node child;
+            child.field = state.field;
+            child.field.apply(op);
+            child.operations = state.operations;
+            child.operations.push_back(op);
+            child.depth = child.operations.size();
+            child.metrics = child.field.evaluate_pair_metrics();
+
+            ++result.explored_nodes;
+
+            const auto child_unmatched = child.metrics.status.unmatched;
+            const auto state_unmatched = state.metrics.status.unmatched;
+
+            if (child_unmatched > state_unmatched) {
+                continue;
+            }
+
+            const auto child_distance = child.metrics.total_unmatched_distance + child.metrics.max_unmatched_distance;
+            const auto state_distance = state.metrics.total_unmatched_distance + state.metrics.max_unmatched_distance;
+
+            if (child_unmatched == state_unmatched && child_distance >= state_distance) {
+                continue;
+            }
+
+            if (!has_child ||
+                child_unmatched < best_child.metrics.status.unmatched ||
+                (child_unmatched == best_child.metrics.status.unmatched &&
+                 child.metrics.total_unmatched_distance < best_child.metrics.total_unmatched_distance)) {
+                best_child = std::move(child);
+                has_child = true;
+            }
+        }
+
+        if (!has_child) {
+            break;
+        }
+
+        best_child.score = evaluate(best_child);
+        state = std::move(best_child);
+        state.metrics = state.field.evaluate_pair_metrics();
+
+        update_best(state, result, best_score);
+        improved = true;
+
+        if (state.metrics.status.unmatched < best_metrics.status.unmatched ||
+            (state.metrics.status.unmatched == best_metrics.status.unmatched &&
+             state.metrics.total_unmatched_distance < best_metrics.total_unmatched_distance)) {
+            best_metrics = state.metrics;
+            best_ops = state.operations;
+        }
+
+        if (state.metrics.status.unmatched == 0) {
+            break;
+        }
+    }
+
+    if (improved) {
+        result.operations = best_ops;
+        result.status = best_metrics.status;
+        result.solved = best_metrics.status.unmatched == 0;
+        state.depth = state.operations.size();
+    }
+
+    return improved;
+}
+
 BeamStackSearchResult BeamStackSearchSolver::solve(const Problem& problem) {
     BeamStackSearchResult result;
     Timer timer;
@@ -336,16 +528,17 @@ BeamStackSearchResult BeamStackSearchSolver::solve(const Problem& problem) {
     double best_score = -1e18;
     update_best(current_root, result, best_score);
 
-    const std::size_t max_iterations = config_.adaptive_limits ? 6 : 1;
+    const std::size_t max_iterations = config_.adaptive_limits ? std::max<std::size_t>(1, config_.max_iterations) : 1;
     std::size_t iteration = 0;
+    std::size_t shakes_used = 0;
 
     while ((config_.time_limit_ms <= 0.0 || timer.elapsed_ms() < config_.time_limit_ms) && iteration < max_iterations) {
         SearchLimits iter_limits = base_limits;
         if (iteration > 0) {
             const double widen_factor = 1.0 + 0.45 * static_cast<double>(iteration);
             const double node_factor = 1.0 + 0.6 * static_cast<double>(iteration);
-            const std::size_t depth_bonus = static_cast<std::size_t>(6 * iteration);
-            const std::size_t child_bonus = static_cast<std::size_t>(std::max<std::size_t>(4, iteration * 4));
+            const std::size_t depth_bonus = static_cast<std::size_t>(10 * iteration);
+            const std::size_t child_bonus = static_cast<std::size_t>(std::max<std::size_t>(8, iteration * 5));
 
             iter_limits.beam_width = static_cast<std::size_t>(std::ceil(iter_limits.beam_width * widen_factor));
             if (config_.beam_width_cap > 0) {
@@ -380,18 +573,41 @@ BeamStackSearchResult BeamStackSearchSolver::solve(const Problem& problem) {
         const auto next_unmatched = outcome.best_unsolved.metrics.status.unmatched;
         const auto next_distance = outcome.best_unsolved.metrics.total_unmatched_distance;
 
-        if (next_unmatched > current_unmatched) {
-            break;
-        }
+        const bool improvement = next_unmatched < current_unmatched ||
+                                 (next_unmatched == current_unmatched && next_distance < current_distance);
 
-        if (next_unmatched == current_unmatched && next_distance >= current_distance) {
+        if (!improvement) {
+            const bool can_shake = config_.shake_attempts > 0 && shakes_used < config_.shake_attempts &&
+                                   (config_.time_limit_ms <= 0.0 ||
+                                    timer.elapsed_ms() < config_.time_limit_ms * config_.shake_time_ratio);
+            if (can_shake) {
+                Node shaken = current_root;
+                if (apply_shake(shaken, result, timer, best_score)) {
+                    current_root = std::move(shaken);
+                    current_root.score = evaluate(current_root);
+                    base_limits = iter_limits;
+                    ++shakes_used;
+                    continue;
+                }
+            }
+            if (iteration + 1 < max_iterations) {
+                base_limits = iter_limits;
+                ++iteration;
+                shakes_used = 0;
+                continue;
+            }
             break;
         }
 
         current_root = outcome.best_unsolved;
         current_root.score = evaluate(current_root);
         base_limits = iter_limits;
+        shakes_used = 0;
         ++iteration;
+    }
+
+    if (!result.solved && (config_.time_limit_ms <= 0.0 || timer.elapsed_ms() < config_.time_limit_ms)) {
+        greedy_refinement(problem, result, timer, best_score);
     }
 
     result.elapsed_ms = timer.elapsed_ms();
