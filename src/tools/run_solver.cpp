@@ -29,27 +29,32 @@ int main(int argc, char** argv) {
         const auto problem = proc36::Problem::load_from_file(problem_path);
 
         proc36::BeamStackSearchConfig config;
-        if (problem.size > 8) {
-            config.rotation_sizes = {2, 3, 4, 5};
-            config.beam_width = 96;
-            config.max_depth = 28;
-            config.max_children_per_node = 48;
+        // 5分 = 300秒 = 300,000ミリ秒の制限時間
+        config.time_limit_ms = 290'000.0;  // 少し余裕を持たせる
+        
+        if (problem.size <= 8) {
+            config.rotation_sizes = {2, 3, 4};
+            config.beam_width = 150;
+            config.max_depth = 80;
+            config.max_children_per_node = 100;
             config.operation_penalty = 0.05;
-            config.time_limit_ms = 4800.0;
-        }
-        if (problem.size >= 16) {
+        } else if (problem.size <= 12) {
+            config.rotation_sizes = {2, 3, 4, 5};
+            config.beam_width = 200;
+            config.max_depth = 100;
+            config.max_children_per_node = 150;
+            config.operation_penalty = 0.04;
+        } else if (problem.size <= 16) {
             config.rotation_sizes = {2, 3, 4, 5, 6};
-            config.beam_width = 128;
-            config.max_depth = 40;
-            config.max_nodes = 200'000;
-            config.max_children_per_node = 64;
+            config.beam_width = 250;
+            config.max_depth = 120;
+            config.max_children_per_node = 200;
             config.operation_penalty = 0.03;
-        }
-        if (problem.size >= 22) {
-            config.beam_width = 160;
-            config.max_depth = 48;
-            config.max_nodes = 300'000;
-            config.time_limit_ms = 4900.0;
+        } else {
+            config.rotation_sizes = {2, 3, 4, 5, 6};
+            config.beam_width = 300;
+            config.max_depth = 150;
+            config.max_children_per_node = 250;
             config.operation_penalty = 0.02;
         }
 

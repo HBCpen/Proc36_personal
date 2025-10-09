@@ -1,187 +1,211 @@
 #include "solver/beam_stack_search.hpp"
 
 #include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <queue>
 #include <unordered_set>
-#include <utility>
+
+#include "lib/timer.hpp"
 
 namespace proc36 {
 
-BeamStackSearchSolver::BeamStackSearchSolver(BeamStackSearchConfig config)
-    : config_(std::move(config)) {}
+BeamStackSearchSolver::BeamStackSearchSolver(const BeamStackSearchConfig& config)
+    : config_(config) {}
 
-std::vector<Operation> BeamStackSearchSolver::generate_operations(const Field& field,
-                                                                  const std::vector<Operation>& history) const {
-    std::vector<Operation> operations;
-    operations.reserve(field.size() * field.size());
-
-    const Operation* last_op = history.empty() ? nullptr : &history.back();
-
-    for (auto size : config_.rotation_sizes) {
-        if (size < 2 || size > field.size()) {
-            continue;
-        }
-        for (std::size_t y = 0; y + size <= field.size(); ++y) {
-            for (std::size_t x = 0; x + size <= field.size(); ++x) {
-                Operation op{x, y, size};
-                if (!field.is_valid_operation(op)) {
-                    continue;
-                }
-                if (last_op != nullptr && last_op->x == op.x && last_op->y == op.y && last_op->size == op.size) {
-                    continue;  // avoid immediately re-applying the same rotation
-                }
-                operations.push_back(op);
+double BeamStackSearchSolver::evaluate(const Field& field, std::size_t num_operations) const {
+    const auto status = field.evaluate_pairs();
+    
+    // すべてのペアが揃っている場合は高スコア
+    if (status.unmatched == 0 && status.matched * 2 == field.cell_count()) {
+        return 10000000.0 - static_cast<double>(num_operations) * config_.operation_penalty;
+    }
+    
+    // マッチしたペアの数を基本スコアとする
+    double score = static_cast<double>(status.matched) * 10000.0;
+    
+    // アンマッチのペアの距離を計算（近いほど良い）
+    const auto field_size = field.size();
+    const auto max_value = field.cell_count() / 2;
+    double distance_penalty = 0.0;
+    
+    for (std::size_t value = 0; value < max_value; ++value) {
+        auto positions = field.positions_of(static_cast<int>(value));
+        if (positions.size() == 2) {
+            const auto& p1 = positions[0];
+            const auto& p2 = positions[1];
+            const auto dx = (p1.x > p2.x) ? (p1.x - p2.x) : (p2.x - p1.x);
+            const auto dy = (p1.y > p2.y) ? (p1.y - p2.y) : (p2.y - p1.y);
+            const auto manhattan_dist = dx + dy;
+            
+            if (manhattan_dist == 1) {
+                // 既にペアになっている（マッチ済み）
+                continue;
+            } else {
+                // マンハッタン距離が遠いほどペナルティ
+                distance_penalty += static_cast<double>(manhattan_dist) * 50.0;
             }
         }
     }
-
-    return operations;
-}
-
-double BeamStackSearchSolver::evaluate(const Node& node) const {
-    const double matched_score = config_.match_weight * static_cast<double>(node.status.matched);
-    const double unmatched_penalty = config_.unmatched_penalty * static_cast<double>(node.status.unmatched);
-    const double depth_penalty = config_.depth_penalty * static_cast<double>(node.depth);
-    const double op_penalty = config_.operation_penalty * static_cast<double>(node.operations.size());
-    const double jitter = random_.next_real(0.0, 1.0) * 1e-3;
-    double score = matched_score - unmatched_penalty - depth_penalty - op_penalty + jitter;
-    if (node.status.unmatched == 0) {
-        score += 1e6;  // strongly prefer solved states
-    }
+    
+    score -= distance_penalty;
+    
+    // 操作回数のペナルティ
+    score -= static_cast<double>(num_operations) * config_.operation_penalty;
+    
     return score;
 }
 
-void BeamStackSearchSolver::update_best(const Node& node, BeamStackSearchResult& best_result, double& best_score) const {
-    const double score = node.score;
-    if (score > best_score) {
-        best_score = score;
-        best_result.operations = node.operations;
-        best_result.status = node.status;
-        best_result.solved = node.status.unmatched == 0;
+std::vector<BeamStackSearchSolver::Node> BeamStackSearchSolver::generate_children(const Node& parent) const {
+    std::vector<Node> children;
+    children.reserve(config_.max_children_per_node);
+    
+    const auto field_size = parent.field.size();
+    
+    // すべての可能な回転操作を生成
+    std::vector<Operation> candidate_ops;
+    for (const auto rot_size : config_.rotation_sizes) {
+        if (rot_size > field_size) {
+            continue;
+        }
+        
+        for (std::size_t y = 0; y + rot_size <= field_size; ++y) {
+            for (std::size_t x = 0; x + rot_size <= field_size; ++x) {
+                candidate_ops.push_back(Operation{x, y, rot_size});
+            }
+        }
     }
+    
+    // 各操作を試す
+    for (const auto& op : candidate_ops) {
+        Node child;
+        child.field = parent.field.applied(op);
+        child.operations = parent.operations;
+        child.operations.push_back(op);
+        child.hash = child.field.zobrist_hash();
+        child.score = evaluate(child.field, child.operations.size());
+        
+        children.push_back(std::move(child));
+        
+        if (children.size() >= config_.max_children_per_node) {
+            break;
+        }
+    }
+    
+    return children;
+}
+
+void BeamStackSearchSolver::select_beam(std::vector<Node>& nodes) const {
+    if (nodes.size() <= config_.beam_width) {
+        return;
+    }
+    
+    // スコアの高い順にソート
+    std::partial_sort(nodes.begin(), 
+                     nodes.begin() + static_cast<long>(config_.beam_width),
+                     nodes.end());
+    
+    // 上位beam_width個のみを残す
+    nodes.resize(config_.beam_width);
 }
 
 BeamStackSearchResult BeamStackSearchSolver::solve(const Problem& problem) {
+    const auto start_time = std::chrono::high_resolution_clock::now();
+    
     BeamStackSearchResult result;
-    Timer timer;
-
-    result.elapsed_ms = 0.0;
     result.explored_nodes = 0;
-
-    Node root;
-    root.field = problem.make_field();
-    root.status = root.field.evaluate_pairs();
-    root.depth = 0;
-    root.score = evaluate(root);
-
-    double best_score = -1e18;
-    update_best(root, result, best_score);
-
-    std::vector<Node> current_layer;
-    current_layer.reserve(config_.beam_width);
-    current_layer.push_back(root);
-
-    std::unordered_set<std::uint64_t> visited;
-    if (config_.use_global_hash) {
-        visited.insert(root.field.zobrist_hash());
+    
+    // 初期状態
+    Node initial;
+    initial.field = problem.make_field();
+    initial.hash = initial.field.zobrist_hash();
+    initial.score = evaluate(initial.field, 0);
+    
+    // 初期状態がゴールかチェック
+    if (initial.field.is_goal_state()) {
+        result.solved = true;
+        result.status = initial.field.evaluate_pairs();
+        const auto end_time = std::chrono::high_resolution_clock::now();
+        result.elapsed_ms = std::chrono::duration<double, std::milli>(end_time - start_time).count();
+        return result;
     }
-
-    for (std::size_t depth = 0; depth < config_.max_depth && !current_layer.empty(); ++depth) {
-        if (config_.time_limit_ms > 0.0 && timer.elapsed_ms() > config_.time_limit_ms) {
+    
+    // ビームサーチのメインループ
+    std::vector<Node> current_beam;
+    current_beam.push_back(std::move(initial));
+    
+    Node best_node = current_beam[0];
+    
+    for (std::size_t depth = 0; depth < config_.max_depth; ++depth) {
+        // 時間制限チェック
+        const auto current_time = std::chrono::high_resolution_clock::now();
+        const double elapsed = std::chrono::duration<double, std::milli>(current_time - start_time).count();
+        if (elapsed >= config_.time_limit_ms) {
             break;
         }
-
-        std::vector<Node> next_layer;
-        next_layer.reserve(config_.beam_width * 2);
-        bool reached_limit = false;
-
-        for (const auto& node : current_layer) {
-            if (config_.time_limit_ms > 0.0 && timer.elapsed_ms() > config_.time_limit_ms) {
-                reached_limit = true;
-                break;
+        
+        std::vector<Node> next_beam;
+        std::unordered_set<std::uint64_t> visited_hashes;
+        
+        // 各ノードから子ノードを生成
+        for (const auto& node : current_beam) {
+            auto children = generate_children(node);
+            result.explored_nodes += children.size();
+            
+            for (auto& child : children) {
+                // 重複チェック
+                if (visited_hashes.count(child.hash) > 0) {
+                    continue;
+                }
+                visited_hashes.insert(child.hash);
+                
+                // ゴール状態をチェック
+                if (child.field.is_goal_state()) {
+                    result.operations = std::move(child.operations);
+                    result.status = child.field.evaluate_pairs();
+                    result.solved = true;
+                    
+                    const auto end_time = std::chrono::high_resolution_clock::now();
+                    result.elapsed_ms = std::chrono::duration<double, std::milli>(end_time - start_time).count();
+                    return result;
+                }
+                
+                // ベストノードの更新
+                if (child.score > best_node.score) {
+                    best_node = child;
+                }
+                
+                next_beam.push_back(std::move(child));
             }
+            
+            // ノード数制限チェック
             if (result.explored_nodes >= config_.max_nodes) {
-                reached_limit = true;
                 break;
             }
-
-            auto candidate_ops = generate_operations(node.field, node.operations);
-            std::vector<Node> children;
-            children.reserve(candidate_ops.size());
-
-            for (const auto& op : candidate_ops) {
-                if (config_.time_limit_ms > 0.0 && timer.elapsed_ms() > config_.time_limit_ms) {
-                    reached_limit = true;
-                    break;
-                }
-                if (result.explored_nodes >= config_.max_nodes) {
-                    reached_limit = true;
-                    break;
-                }
-
-                Node child;
-                child.field = node.field;
-                child.field.apply(op);
-                if (config_.use_global_hash) {
-                    const auto hash = child.field.zobrist_hash();
-                    if (visited.find(hash) != visited.end()) {
-                        continue;
-                    }
-                    visited.insert(hash);
-                }
-
-                child.operations = node.operations;
-                child.operations.push_back(op);
-                child.depth = node.depth + 1;
-                child.status = child.field.evaluate_pairs();
-                child.score = evaluate(child);
-
-                children.push_back(std::move(child));
-                ++result.explored_nodes;
-            }
-
-            if (reached_limit) {
-                break;
-            }
-
-            if (children.empty()) {
-                continue;
-            }
-
-            if (config_.max_children_per_node > 0 && children.size() > config_.max_children_per_node) {
-                std::partial_sort(children.begin(),
-                                  children.begin() + static_cast<std::ptrdiff_t>(config_.max_children_per_node), children.end(),
-                                  [](const Node& a, const Node& b) { return a.score > b.score; });
-                children.resize(config_.max_children_per_node);
-            }
-
-            for (const auto& child : children) {
-                update_best(child, result, best_score);
-                next_layer.push_back(child);
-                if (child.status.unmatched == 0) {
-                    goto finished;  // found a solution
-                }
-            }
         }
-
-        if (reached_limit) {
+        
+        if (next_beam.empty()) {
             break;
         }
-
-        if (next_layer.empty()) {
+        
+        // ビーム選択
+        select_beam(next_beam);
+        current_beam = std::move(next_beam);
+        
+        // ノード数制限チェック
+        if (result.explored_nodes >= config_.max_nodes) {
             break;
         }
-
-        if (next_layer.size() > config_.beam_width) {
-            std::partial_sort(next_layer.begin(), next_layer.begin() + static_cast<std::ptrdiff_t>(config_.beam_width),
-                              next_layer.end(), [](const Node& a, const Node& b) { return a.score > b.score; });
-            next_layer.resize(config_.beam_width);
-        }
-
-        current_layer = std::move(next_layer);
     }
-
-finished:
-    result.elapsed_ms = timer.elapsed_ms();
+    
+    // ゴールに到達しなかった場合は、最良ノードを返す
+    result.operations = std::move(best_node.operations);
+    result.status = best_node.field.evaluate_pairs();
+    result.solved = best_node.field.is_goal_state();
+    
+    const auto end_time = std::chrono::high_resolution_clock::now();
+    result.elapsed_ms = std::chrono::duration<double, std::milli>(end_time - start_time).count();
+    
     return result;
 }
 
