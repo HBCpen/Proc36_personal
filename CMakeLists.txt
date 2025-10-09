@@ -18,6 +18,7 @@ add_compile_options(
 add_library(proc36_lib
     src/lib/field.cpp
     src/lib/problem.cpp
+    src/solver/beam_stack_search.cpp
 )
 
 target_include_directories(proc36_lib
@@ -30,3 +31,9 @@ add_executable(local_runner
 )
 
 target_link_libraries(local_runner PRIVATE proc36_lib)
+
+add_executable(beam_solver
+    src/tools/run_solver.cpp
+)
+
+target_link_libraries(beam_solver PRIVATE proc36_lib)

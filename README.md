@@ -45,3 +45,14 @@ cmake --build build
 ```
 
 `Docs/sample_problem.json` と `Docs/sample_ops.json` は簡易サンプルです。操作列を省略した場合は初期盤面のペア状況のみを表示します。
+
+### Beam Stack Search ソルバー
+
+ビームスタックサーチの初期実装を `beam_solver` として提供しています。問題ファイルを入力すると操作列を探索し、結果を標準出力またはファイルに書き出します。
+
+```bash
+./build/beam_solver Docs/sample_problem.json
+./build/beam_solver Docs/sample_problem.json answer.json
+```
+
+引数を1つだけ渡した場合は、生成した操作列を標準出力にJSON形式で表示します。2つ目の引数を指定すると、そのファイルにJSONを保存します。
