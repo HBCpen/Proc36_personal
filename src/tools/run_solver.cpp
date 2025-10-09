@@ -41,7 +41,7 @@ int main(int argc, char** argv) {
         } else if (problem.size <= 12) {
             config.rotation_sizes = {2, 3, 4, 5};
             config.beam_width = 200;
-            config.max_depth = 100;
+            config.max_depth = 1000;
             config.max_children_per_node = 150;
             config.operation_penalty = 0.04;
         } else if (problem.size <= 16) {

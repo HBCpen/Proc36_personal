@@ -1,8 +1,10 @@
 #include "solver/beam_stack_search.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
+#include <mutex>
 #include <queue>
 #include <unordered_set>
 
@@ -145,43 +147,94 @@ BeamStackSearchResult BeamStackSearchSolver::solve(const Problem& problem) {
         }
         
         std::vector<Node> next_beam;
+        next_beam.reserve(current_beam.size() * std::min(config_.max_children_per_node, config_.beam_width));
         std::unordered_set<std::uint64_t> visited_hashes;
-        
-        // 各ノードから子ノードを生成
-        for (const auto& node : current_beam) {
+        visited_hashes.reserve(current_beam.size() * std::min<std::size_t>(config_.max_children_per_node, config_.beam_width));
+        visited_hashes.max_load_factor(0.7F);
+
+        std::mutex visited_mutex;
+        std::mutex next_mutex;
+        std::mutex best_mutex;
+        std::mutex result_mutex;
+
+        const std::size_t base_explored = result.explored_nodes;
+        std::atomic<std::size_t> explored_atomic{0};
+        std::atomic<bool> node_limit_reached{base_explored >= config_.max_nodes};
+        std::atomic<bool> solved_flag{false};
+
+        auto process_node = [&](const Node& node) {
+            if (solved_flag.load(std::memory_order_acquire) || node_limit_reached.load(std::memory_order_acquire)) {
+                return;
+            }
+
             auto children = generate_children(node);
-            result.explored_nodes += children.size();
-            
+            const std::size_t explored_after = explored_atomic.fetch_add(children.size(), std::memory_order_relaxed) + children.size();
+            if (base_explored + explored_after >= config_.max_nodes) {
+                node_limit_reached.store(true, std::memory_order_release);
+            }
+
+            if (children.empty()) {
+                return;
+            }
+
+            std::vector<Node> accepted;
+            accepted.reserve(children.size());
+
             for (auto& child : children) {
-                // 重複チェック
-                if (visited_hashes.count(child.hash) > 0) {
+                if (solved_flag.load(std::memory_order_acquire) || node_limit_reached.load(std::memory_order_acquire)) {
+                    break;
+                }
+
+                bool inserted = false;
+                {
+                    std::lock_guard<std::mutex> lock(visited_mutex);
+                    inserted = visited_hashes.insert(child.hash).second;
+                }
+                if (!inserted) {
                     continue;
                 }
-                visited_hashes.insert(child.hash);
-                
-                // ゴール状態をチェック
+
                 if (child.field.is_goal_state()) {
-                    result.operations = std::move(child.operations);
-                    result.status = child.field.evaluate_pairs();
-                    result.solved = true;
-                    
-                    const auto end_time = std::chrono::high_resolution_clock::now();
-                    result.elapsed_ms = std::chrono::duration<double, std::milli>(end_time - start_time).count();
-                    return result;
+                    bool expected = false;
+                    if (solved_flag.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
+                        std::lock_guard<std::mutex> lock(result_mutex);
+                        result.operations = std::move(child.operations);
+                        result.status = child.field.evaluate_pairs();
+                        result.solved = true;
+                    }
+                    break;
                 }
-                
-                // ベストノードの更新
-                if (child.score > best_node.score) {
-                    best_node = child;
+
+                {
+                    std::lock_guard<std::mutex> lock(best_mutex);
+                    if (child.score > best_node.score) {
+                        best_node = child;
+                    }
                 }
-                
-                next_beam.push_back(std::move(child));
+
+                accepted.push_back(std::move(child));
             }
-            
-            // ノード数制限チェック
-            if (result.explored_nodes >= config_.max_nodes) {
-                break;
+
+            if (!accepted.empty()) {
+                std::lock_guard<std::mutex> lock(next_mutex);
+                for (auto& accepted_node : accepted) {
+                    next_beam.push_back(std::move(accepted_node));
+                }
             }
+        };
+
+        parallel_for_each(current_beam, process_node);
+
+        result.explored_nodes += explored_atomic.load(std::memory_order_relaxed);
+
+        if (result.solved) {
+            const auto end_time = std::chrono::high_resolution_clock::now();
+            result.elapsed_ms = std::chrono::duration<double, std::milli>(end_time - start_time).count();
+            return result;
+        }
+
+        if (node_limit_reached.load(std::memory_order_acquire)) {
+            break;
         }
         
         if (next_beam.empty()) {
