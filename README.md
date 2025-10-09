@@ -29,3 +29,19 @@
   このとき、全てのペアを揃えるプログラムを作成せよ。ただし、以下の条件が適用される
   - プログラムは**5分以内に計算可能**でなければならない
   - すべてのペアがそろっている場合、完成までに必要な操作の回数が少ないものがより優れている(ただし、全てのペアが揃っていない場合は評価の対象としない)
+
+## 開発ツール
+
+### ローカルランナー
+
+ローカルで問題データと操作列を適用した結果を確認するためのランナーを用意しています。
+
+```bash
+cmake -B build -S .
+cmake --build build
+
+./build/local_runner Docs/sample_problem.json
+./build/local_runner Docs/sample_problem.json Docs/sample_ops.json
+```
+
+`Docs/sample_problem.json` と `Docs/sample_ops.json` は簡易サンプルです。操作列を省略した場合は初期盤面のペア状況のみを表示します。
